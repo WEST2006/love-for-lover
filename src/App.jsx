@@ -39,6 +39,7 @@ const NAV_TABS = [
 
 export default function App() {
   const [authMeta, setAuthMeta] = useState(null);
+  const [authLoadError, setAuthLoadError] = useState('');
   const [token, setToken] = useState(() => getSavedToken());
   const [passcodeInput, setPasscodeInput] = useState('');
   const [authError, setAuthError] = useState('');
@@ -97,7 +98,8 @@ export default function App() {
   }, []);
 
   // Check initial auth status
-  useEffect(() => {
+  function loadAuthStatus() {
+    setAuthLoadError('');
     apiFetch('/api/auth/status')
       .then((meta) => {
         setAuthMeta(meta);
@@ -106,7 +108,13 @@ export default function App() {
           setToken('');
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        setAuthLoadError(err?.message || '连接小屋云端失败，请检查网络或 Supabase 配置');
+      });
+  }
+
+  useEffect(() => {
+    loadAuthStatus();
   }, [token]);
 
   function spawnParticles(count = 7, isBurst = false) {
@@ -680,11 +688,23 @@ export default function App() {
   // Waiting for initial auth check
   if (!authMeta) {
     return (
-      <div className="loading-screen">
+      <div className="loading-screen" style={{ padding: 24, textAlign: 'center' }}>
         <div className="loading-orb">
           <HeartMedallion size={64} />
         </div>
-        <p className="serif-title">正在靠近心动小屋...</p>
+        <p className="serif-title">
+          {authLoadError ? '小屋门暂时没推开' : '正在靠近心动小屋...'}
+        </p>
+        {authLoadError && (
+          <>
+            <p style={{ fontSize: 12, color: '#9e7e85', maxWidth: 320, margin: '4px 0 10px' }}>
+              {authLoadError}
+            </p>
+            <button type="button" className="mini-outline-btn" onClick={loadAuthStatus}>
+              点击重试连接
+            </button>
+          </>
+        )}
       </div>
     );
   }

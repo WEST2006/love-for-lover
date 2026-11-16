@@ -231,3 +231,5 @@ grant execute on function public.love_unlock(text, jsonb) to anon, authenticated
 grant execute on function public.love_get_state(text) to anon, authenticated;
 grant execute on function public.love_save_state(text, jsonb) to anon, authenticated;
 grant execute on function public.love_change_passcode(text, text) to anon, authenticated;
+
+notify pgrst, 'reload schema';
