@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       server_url:
-        description: '填入部署后的小屋公网地址（例如 https://love-for-lover.vercel.app）'
+        description: '填入部署后的小屋公网地址（例如 https://west2006.github.io/love-for-lover/）'
         required: false
-        default: 'https://love-for-lover.vercel.app'
+        default: 'https://west2006.github.io/love-for-lover/'
 
 jobs:
   build-apk:

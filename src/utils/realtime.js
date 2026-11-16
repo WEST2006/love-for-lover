@@ -7,7 +7,7 @@ export function isSupabaseRealtimeEnabled() {
   return Boolean(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY);
 }
 
-function getClient() {
+export function getRealtimeClient() {
   if (client) return client;
   client = createClient(
     import.meta.env.VITE_SUPABASE_URL,
@@ -19,7 +19,7 @@ function getClient() {
 export function subscribeRealtime({ role, onPresence, onEvent }) {
   if (!isSupabaseRealtimeEnabled()) return () => {};
 
-  const sb = getClient();
+  const sb = getRealtimeClient();
   const channel = sb.channel('love-space-room', {
     config: {
       broadcast: { self: false },

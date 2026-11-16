@@ -1,3 +1,5 @@
+import { handleDirectSupabaseApi } from './cloudApi';
+
 const TOKEN_KEY = 'love_space_token';
 
 export function getSavedToken() {
@@ -16,6 +18,11 @@ export function saveToken(token) {
 
 export async function apiFetch(url, options = {}) {
   const token = getSavedToken();
+
+  if (import.meta.env.VITE_DIRECT_SUPABASE === 'true') {
+    return handleDirectSupabaseApi(url, options, token);
+  }
+
   const headers = {
     ...(options.body ? { 'Content-Type': 'application/json' } : {}),
     ...(options.headers || {}),

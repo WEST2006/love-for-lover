@@ -92,7 +92,7 @@ export default function App() {
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
+      navigator.serviceWorker.register('./sw.js').catch(() => {});
     }
   }, []);
 
@@ -141,7 +141,7 @@ export default function App() {
       Notification.permission === 'granted'
     ) {
       try {
-        new Notification(title, { body, icon: '/icon.svg' });
+        new Notification(title, { body, icon: './icon-192.png' });
       } catch {
         // ignore
       }
@@ -294,7 +294,7 @@ export default function App() {
         if (document.visibilityState === 'visible') refreshState();
       };
       document.addEventListener('visibilitychange', onVis);
-      const pollTimer = setInterval(refreshState, 15000);
+      const pollTimer = setInterval(refreshState, 5000);
 
       return () => {
         active = false;

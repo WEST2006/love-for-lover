@@ -1,0 +1,67 @@
+name: Deploy Website to GitHub Pages
+
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+    inputs:
+      supabase_anon_key:
+        description: '可选：临时填入 Supabase Publishable Key (sb_publishable_...)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: 'pages'
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build GitHub Pages static bundle
+        env:
+          VITE_DIRECT_SUPABASE: 'true'
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL || 'https://ozwayifvdvbjfkmjahkl.supabase.co' }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || vars.VITE_SUPABASE_ANON_KEY || github.event.inputs.supabase_anon_key }}
+        run: |
+          if [ -z "$VITE_SUPABASE_ANON_KEY" ]; then
+            echo "❌ 请先在仓库 Settings -> Secrets and variables -> Actions 中添加变量 VITE_SUPABASE_ANON_KEY（填入你的 sb_publishable_... 密钥）！"
+            exit 1
+          fi
+          npm run build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
