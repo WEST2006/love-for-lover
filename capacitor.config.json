@@ -1,0 +1,9 @@
+{
+  "appId": "com.lovespace.app",
+  "appName": "心动小屋",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": true,
+    "backgroundColor": "#FDF4F1"
+  }
+}

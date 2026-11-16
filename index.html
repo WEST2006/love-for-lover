@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>我们的心动小屋 · 跨越山海来想你</title>
+    <meta name="theme-color" content="#E25568" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="心动小屋" />
+    <link rel="icon" type="image/png" href="/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.json" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      if (window.location.protocol === 'file:') {
+        document.getElementById('root').innerHTML =
+          '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#fff5f2;font-family:Microsoft YaHei,sans-serif;padding:24px;box-sizing:border-box;">' +
+          '<div style="max-width:420px;background:#fff;border-radius:24px;padding:28px 24px;box-shadow:0 16px 40px rgba(224,83,104,.16);border:1px solid #ffd8df;text-align:center;color:#3a2328;">' +
+          '<div style="font-size:40px;margin-bottom:8px;">💌</div>' +
+          '<h2 style="margin:0 0 10px;font-size:20px;">不能直接双击打开 index.html 哦</h2>' +
+          '<p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#7a5860;">因为这是前后端实时联动的网页应用，需要通过本地服务地址打开：<br><strong style="color:#d94862;">http://localhost:3001</strong></p>' +
+          '<a href="http://localhost:3001" style="display:inline-block;padding:11px 22px;border-radius:999px;background:linear-gradient(135deg,#e7556b,#eb8662);color:#fff;text-decoration:none;font-weight:700;font-size:14px;">点我打开心动小屋</a>' +
+          '<p style="margin:14px 0 0;font-size:12px;color:#99777e;">如果打不开，请双击文件夹里的「一键启动心动小屋.bat」</p>' +
+          '</div></div>';
+      }
+    </script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
