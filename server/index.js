@@ -244,14 +244,14 @@ function createDefaultStore() {
 function migrateStore(loaded) {
   const def = createDefaultStore();
   const s = { ...def, ...loaded };
+  const resolvedPasscode =
+    loaded?.security?.passcode || process.env.LOVE_PASSCODE || def.security.passcode;
   s.security = {
-    passcode: process.env.LOVE_PASSCODE || loaded?.security?.passcode || def.security.passcode,
+    passcode: resolvedPasscode,
     isDefaultPasscode:
-      process.env.LOVE_PASSCODE
-        ? process.env.LOVE_PASSCODE === '5201314'
-        : loaded?.security?.isDefaultPasscode !== undefined
+      loaded?.security?.isDefaultPasscode !== undefined
         ? loaded.security.isDefaultPasscode
-        : (loaded?.security?.passcode || DEFAULT_PASSCODE) === '5201314',
+        : resolvedPasscode === '5201314',
     secret: loaded?.security?.secret || def.security.secret,
   };
   s.couple = { ...def.couple, ...(loaded?.couple || {}) };
