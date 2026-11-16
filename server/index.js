@@ -4,6 +4,11 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import {
+  isCloudStorageEnabled,
+  loadPersistedStore,
+  persistStoreData,
+} from './storeAdapter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -46,7 +51,7 @@ function createDefaultStore() {
   return {
     security: {
       passcode: DEFAULT_PASSCODE,
-      isDefaultPasscode: true,
+      isDefaultPasscode: DEFAULT_PASSCODE === '5201314',
       secret: crypto.randomBytes(24).toString('hex'),
     },
     couple: {
@@ -240,11 +245,13 @@ function migrateStore(loaded) {
   const def = createDefaultStore();
   const s = { ...def, ...loaded };
   s.security = {
-    passcode: loaded?.security?.passcode || def.security.passcode,
+    passcode: process.env.LOVE_PASSCODE || loaded?.security?.passcode || def.security.passcode,
     isDefaultPasscode:
-      loaded?.security?.isDefaultPasscode !== undefined
+      process.env.LOVE_PASSCODE
+        ? process.env.LOVE_PASSCODE === '5201314'
+        : loaded?.security?.isDefaultPasscode !== undefined
         ? loaded.security.isDefaultPasscode
-        : (loaded?.security?.passcode || DEFAULT_PASSCODE) === DEFAULT_PASSCODE,
+        : (loaded?.security?.passcode || DEFAULT_PASSCODE) === '5201314',
     secret: loaded?.security?.secret || def.security.secret,
   };
   s.couple = { ...def.couple, ...(loaded?.couple || {}) };
@@ -284,30 +291,30 @@ function migrateStore(loaded) {
   return s;
 }
 
-function loadStore() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(STORE_PATH)) {
-    const initial = createDefaultStore();
-    fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), 'utf8');
-    return initial;
-  }
-  try {
-    const raw = fs.readFileSync(STORE_PATH, 'utf8');
-    const migrated = migrateStore(JSON.parse(raw));
-    fs.writeFileSync(STORE_PATH, JSON.stringify(migrated, null, 2), 'utf8');
-    return migrated;
-  } catch {
-    const fallback = createDefaultStore();
-    fs.writeFileSync(STORE_PATH, JSON.stringify(fallback, null, 2), 'utf8');
-    return fallback;
-  }
+let store = null;
+
+async function saveStore() {
+  if (!store) return;
+  await persistStoreData({ store, storePath: STORE_PATH, dataDir: DATA_DIR });
 }
 
-let store = loadStore();
-
-function saveStore() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+async function getStore() {
+  if (isCloudStorageEnabled() || !store) {
+    store = await loadPersistedStore({
+      storePath: STORE_PATH,
+      dataDir: DATA_DIR,
+      createDefaultStore,
+      migrateStore,
+    });
+  }
+  const today = getTodayStr();
+  if (store.todayDate !== today) {
+    store.todayDate = today;
+    store.partners.him.missCountToday = 0;
+    store.partners.her.missCountToday = 0;
+    await saveStore();
+  }
+  return store;
 }
 
 function sanitizeState() {
@@ -317,6 +324,7 @@ function sanitizeState() {
     securityInfo: {
       isDefaultPasscode: Boolean(security?.isDefaultPasscode),
     },
+    storageMode: isCloudStorageEnabled() ? 'cloud' : 'local',
   };
 }
 
@@ -345,22 +353,15 @@ function extractToken(req) {
   return '';
 }
 
-function requireAuth(req, res, next) {
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+const requireAuth = ah(async (req, res, next) => {
+  await getStore();
   if (!isTokenValid(extractToken(req))) {
     return res.status(401).json({ error: '需要输入专属空间口令才能进入哦' });
   }
   next();
-}
-
-function ensureTodayReset() {
-  const today = getTodayStr();
-  if (store.todayDate !== today) {
-    store.todayDate = today;
-    store.partners.him.missCountToday = 0;
-    store.partners.her.missCountToday = 0;
-    saveStore();
-  }
-}
+});
 
 function addRecentEvent(by, emoji, text) {
   store.recentEvents = [
@@ -387,6 +388,7 @@ function getOnlineRoles() {
 }
 
 function broadcast(eventName, payload) {
+  if (sseClients.size === 0) return;
   const safePayload = {
     ...payload,
     state: payload.state ? sanitizeState() : undefined,
@@ -405,11 +407,12 @@ function broadcast(eventName, payload) {
 const pendingPulsePush = new Map();
 
 async function dispatchExternalPush(targetRole, title, body) {
-  const target = store.partners[targetRole];
+  const target = store?.partners?.[targetRole];
   const rawUrl = target?.pushUrl?.trim();
   if (!rawUrl) return { sent: false, reason: 'no_url' };
 
   const appUrl = store.couple.appPublicUrl?.trim();
+  const signal = typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(2200) : undefined;
 
   try {
     if (rawUrl.includes('api.day.app') || /\/[A-Za-z0-9]{16,}\/?$/.test(rawUrl)) {
@@ -426,6 +429,7 @@ async function dispatchExternalPush(targetRole, title, body) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal,
       });
       return { sent: true, channel: 'bark' };
     }
@@ -440,6 +444,7 @@ async function dispatchExternalPush(targetRole, title, body) {
           content: `<p>${body}</p>${linkHtml}`,
           template: 'html',
         }),
+        signal,
       });
       return { sent: true, channel: 'pushplus' };
     }
@@ -457,6 +462,7 @@ async function dispatchExternalPush(targetRole, title, body) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(bodyObj),
+        signal,
       });
       return { sent: true, channel: 'bot_webhook' };
     }
@@ -469,6 +475,7 @@ async function dispatchExternalPush(targetRole, title, body) {
           ...(appUrl ? { Click: appUrl } : {}),
         },
         body,
+        signal,
       });
       return { sent: true, channel: 'ntfy' };
     }
@@ -477,6 +484,7 @@ async function dispatchExternalPush(targetRole, title, body) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title, body, url: appUrl || undefined, ts: Date.now() }),
+      signal,
     });
     return { sent: true, channel: 'webhook' };
   } catch (err) {
@@ -485,9 +493,23 @@ async function dispatchExternalPush(targetRole, title, body) {
   }
 }
 
-function schedulePulsePush(fromRole, actionLabel, comboCount) {
+async function schedulePulsePush(fromRole, actionLabel, comboCount) {
   const targetRole = fromRole === 'him' ? 'her' : 'him';
   const sender = store.partners[fromRole];
+
+  if (process.env.VERCEL) {
+    // Serverless cannot rely on delayed timers; push on 1st or every 5th tap
+    if (comboCount === 1 || comboCount % 5 === 0) {
+      const title = `💗 ${sender.name}`;
+      const body =
+        comboCount > 1
+          ? `刚刚连续对你发了 ${comboCount} 次「${actionLabel}」，快打开看看！`
+          : `刚刚对你发了一个「${actionLabel}」`;
+      await dispatchExternalPush(targetRole, title, body);
+    }
+    return;
+  }
+
   const existing = pendingPulsePush.get(targetRole);
   if (existing) {
     clearTimeout(existing.timer);
@@ -512,55 +534,70 @@ const app = express();
 app.use(express.json({ limit: '16mb' }));
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+  res.json({
+    ok: true,
+    storage: isCloudStorageEnabled() ? 'supabase' : 'local',
+    ts: Date.now(),
+  });
 });
 
 // Public auth gate metadata
-app.get('/api/auth/status', (req, res) => {
-  const token = extractToken(req);
-  const authorized = isTokenValid(token);
-  res.json({
-    authorized,
-    title: store.couple.title,
-    loveQuote: store.couple.loveQuote,
-    isDefaultPasscode: Boolean(store.security?.isDefaultPasscode),
-    partners: {
-      him: { name: store.partners.him.name, avatarEmoji: store.partners.him.avatarEmoji },
-      her: { name: store.partners.her.name, avatarEmoji: store.partners.her.avatarEmoji },
-    },
-  });
-});
+app.get(
+  '/api/auth/status',
+  ah(async (req, res) => {
+    await getStore();
+    const token = extractToken(req);
+    const authorized = isTokenValid(token);
+    res.json({
+      authorized,
+      title: store.couple.title,
+      loveQuote: store.couple.loveQuote,
+      isDefaultPasscode: Boolean(store.security?.isDefaultPasscode),
+      partners: {
+        him: { name: store.partners.him.name, avatarEmoji: store.partners.him.avatarEmoji },
+        her: { name: store.partners.her.name, avatarEmoji: store.partners.her.avatarEmoji },
+      },
+    });
+  })
+);
 
-app.post('/api/auth/unlock', (req, res) => {
-  const code = String(req.body?.passcode || '').trim();
-  if (!code || code !== store.security.passcode) {
-    return res.status(403).json({ error: '暗号不对哦，再想想你们的专属口令~' });
-  }
-  ensureTodayReset();
-  res.json({
-    token: makeAuthToken(),
-    state: sanitizeState(),
-    online: getOnlineRoles(),
-  });
-});
+app.post(
+  '/api/auth/unlock',
+  ah(async (req, res) => {
+    await getStore();
+    const code = String(req.body?.passcode || '').trim();
+    if (!code || code !== store.security.passcode) {
+      return res.status(403).json({ error: '暗号不对哦，再想想你们的专属口令~' });
+    }
+    res.json({
+      token: makeAuthToken(),
+      state: sanitizeState(),
+      online: getOnlineRoles(),
+    });
+  })
+);
 
 // Change passcode (authenticated)
-app.post('/api/auth/passcode', requireAuth, (req, res) => {
-  const nextCode = String(req.body?.passcode || '').trim();
-  if (nextCode.length < 4 || nextCode.length > 24) {
-    return res.status(400).json({ error: '新口令长度需要在 4 到 24 个字符之间' });
-  }
-  store.security.passcode = nextCode;
-  store.security.isDefaultPasscode = false;
-  saveStore();
-  res.json({
-    ok: true,
-    token: makeAuthToken(),
-    state: sanitizeState(),
-  });
-});
+app.post(
+  '/api/auth/passcode',
+  requireAuth,
+  ah(async (req, res) => {
+    const nextCode = String(req.body?.passcode || '').trim();
+    if (nextCode.length < 4 || nextCode.length > 24) {
+      return res.status(400).json({ error: '新口令长度需要在 4 到 24 个字符之间' });
+    }
+    store.security.passcode = nextCode;
+    store.security.isDefaultPasscode = false;
+    await saveStore();
+    res.json({
+      ok: true,
+      token: makeAuthToken(),
+      state: sanitizeState(),
+    });
+  })
+);
 
-// SSE stream (authenticated)
+// SSE stream (used in local/VPS mode)
 app.get('/api/events', requireAuth, (req, res) => {
   const role = req.query.role === 'her' ? 'her' : req.query.role === 'him' ? 'him' : 'guest';
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
@@ -571,7 +608,6 @@ app.get('/api/events', requireAuth, (req, res) => {
   const client = { res, role, lastSeen: Date.now() };
   sseClients.add(client);
 
-  ensureTodayReset();
   res.write(
     `event: init\ndata: ${JSON.stringify({ state: sanitizeState(), online: getOnlineRoles() })}\n\n`
   );
@@ -592,622 +628,702 @@ app.get('/api/events', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/state', requireAuth, (_req, res) => {
-  ensureTodayReset();
-  res.json({ state: sanitizeState(), online: getOnlineRoles() });
-});
+app.get(
+  '/api/state',
+  requireAuth,
+  ah(async (_req, res) => {
+    res.json({ state: sanitizeState(), online: getOnlineRoles() });
+  })
+);
 
-app.post('/api/pulse', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const action = req.body.action || { key: 'miss', emoji: '💗', label: '想你了' };
-  const combo = Number(req.body.combo || 1);
+app.post(
+  '/api/pulse',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const action = req.body.action || { key: 'miss', emoji: '💗', label: '想你了' };
+    const combo = Number(req.body.combo || 1);
 
-  const now = Date.now();
-  store.partners[from].missCountToday += 1;
-  store.partners[from].lastPulseAt = now;
+    const now = Date.now();
+    store.partners[from].missCountToday += 1;
+    store.partners[from].lastPulseAt = now;
 
-  let telepathy = false;
-  const partnerLast = store.partners[target].lastPulseAt || 0;
-  if (partnerLast && now - partnerLast <= 12000 && now - (store.lastTelepathyAt || 0) > 15000) {
-    telepathy = true;
-    store.telepathyCount = (store.telepathyCount || 0) + 1;
-    store.lastTelepathyAt = now;
-    addRecentEvent(from, '✨', '触发了「心有灵犀」，同一刻在想念彼此');
-  } else if (combo === 1 || combo % 10 === 0) {
-    addRecentEvent(
+    let telepathy = false;
+    const partnerLast = store.partners[target].lastPulseAt || 0;
+    if (partnerLast && now - partnerLast <= 12000 && now - (store.lastTelepathyAt || 0) > 15000) {
+      telepathy = true;
+      store.telepathyCount = (store.telepathyCount || 0) + 1;
+      store.lastTelepathyAt = now;
+      addRecentEvent(from, '✨', '触发了「心有灵犀」，同一刻在想念彼此');
+    } else if (combo === 1 || combo % 10 === 0) {
+      addRecentEvent(
+        from,
+        action.emoji || '💗',
+        combo > 1 ? `连续发射了 ${combo} 次「${action.label}」` : `向你发送了「${action.label}」`
+      );
+    }
+
+    await saveStore();
+
+    const eventPayload = {
       from,
-      action.emoji || '💗',
-      combo > 1 ? `连续发射了 ${combo} 次「${action.label}」` : `向你发送了「${action.label}」`
+      target,
+      action,
+      combo,
+      telepathy,
+      telepathyCount: store.telepathyCount,
+      state: sanitizeState(),
+      ts: now,
+    };
+
+    broadcast('pulse', eventPayload);
+    await schedulePulsePush(from, action.label || '想你了', combo);
+
+    if (telepathy) {
+      await dispatchExternalPush(target, '✨ 心有灵犀！', '你们竟然在同一刻想起了彼此，快打开看看！');
+    }
+
+    res.json(eventPayload);
+  })
+);
+
+app.post(
+  '/api/mood',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const mood = String(req.body.mood || 'miss');
+    const moodLabel = String(req.body.moodLabel || '想你');
+    const moodEmoji = String(req.body.moodEmoji || '💗');
+
+    store.partners[from].mood = mood;
+    store.partners[from].moodUpdatedAt = Date.now();
+    addRecentEvent(from, moodEmoji, `切换了此刻状态：${moodLabel}`);
+    await saveStore();
+
+    const payload = {
+      from,
+      target,
+      mood,
+      moodLabel,
+      moodEmoji,
+      state: sanitizeState(),
+      ts: Date.now(),
+    };
+    broadcast('mood', payload);
+    await dispatchExternalPush(
+      target,
+      `${moodEmoji} ${store.partners[from].name}`,
+      `TA 把状态换成了「${moodLabel}」${mood === 'hug' ? '，快去抱抱 TA 吧！' : ''}`
     );
-  }
+    res.json(payload);
+  })
+);
 
-  saveStore();
+app.post(
+  '/api/polaroid',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const imageData = String(req.body.imageData || '');
+    const caption = String(req.body.caption || '').slice(0, 40);
+    const cityTag = String(req.body.cityTag || store.partners[from].city || '此刻').slice(0, 16);
 
-  const eventPayload = {
-    from,
-    target,
-    action,
-    combo,
-    telepathy,
-    telepathyCount: store.telepathyCount,
-    state: sanitizeState(),
-    ts: now,
-  };
-
-  broadcast('pulse', eventPayload);
-  schedulePulsePush(from, action.label || '想你了', combo);
-
-  if (telepathy) {
-    dispatchExternalPush(target, '✨ 心有灵犀！', '你们竟然在同一刻想起了彼此，快打开看看！');
-  }
-
-  res.json(eventPayload);
-});
-
-app.post('/api/mood', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const mood = String(req.body.mood || 'miss');
-  const moodLabel = String(req.body.moodLabel || '想你');
-  const moodEmoji = String(req.body.moodEmoji || '💗');
-
-  store.partners[from].mood = mood;
-  store.partners[from].moodUpdatedAt = Date.now();
-  addRecentEvent(from, moodEmoji, `切换了此刻状态：${moodLabel}`);
-  saveStore();
-
-  const payload = {
-    from,
-    target,
-    mood,
-    moodLabel,
-    moodEmoji,
-    state: sanitizeState(),
-    ts: Date.now(),
-  };
-  broadcast('mood', payload);
-  dispatchExternalPush(
-    target,
-    `${moodEmoji} ${store.partners[from].name}`,
-    `TA 把状态换成了「${moodLabel}」${mood === 'hug' ? '，快去抱抱 TA 吧！' : ''}`
-  );
-  res.json(payload);
-});
-
-app.post('/api/polaroid', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const imageData = String(req.body.imageData || '');
-  const caption = String(req.body.caption || '').slice(0, 40);
-  const cityTag = String(req.body.cityTag || store.partners[from].city || '此刻').slice(0, 16);
-
-  if (!imageData) {
-    return res.status(400).json({ error: '请先选择一张照片呀' });
-  }
-
-  if (store.polaroid?.imageData) {
-    store.polaroidHistory = [store.polaroid, ...(store.polaroidHistory || [])].slice(0, 36);
-  }
-
-  const now = Date.now();
-  store.polaroid = {
-    id: `pol-${now}`,
-    author: from,
-    imageData,
-    caption: caption || '拍下这一刻寄给你',
-    cityTag,
-    createdAt: now,
-    stamps: [],
-  };
-  addRecentEvent(from, '📸', `寄来一张新拍立得「${store.polaroid.caption}」`);
-  saveStore();
-
-  const payload = { from, target, polaroid: store.polaroid, state: sanitizeState(), ts: now };
-  broadcast('polaroid', payload);
-  dispatchExternalPush(
-    target,
-    `📸 ${store.partners[from].name} 寄来一张拍立得`,
-    store.polaroid.caption
-  );
-  res.json(payload);
-});
-
-app.post('/api/polaroid/stamp', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const polaroidId = req.body.polaroidId ? String(req.body.polaroidId) : store.polaroid.id;
-  const label = String(req.body.label || '可爱满分').slice(0, 12);
-  const emoji = String(req.body.emoji || '♡');
-  const now = Date.now();
-
-  const stamp = {
-    id: `st-${now}-${Math.random().toString(36).slice(2, 5)}`,
-    by: from,
-    label,
-    emoji,
-    x: Math.round(18 + Math.random() * 62),
-    y: Math.round(20 + Math.random() * 58),
-    rotate: Math.round(-16 + Math.random() * 32),
-    createdAt: now,
-  };
-
-  if (polaroidId === store.polaroid.id) {
-    store.polaroid.stamps = [...(store.polaroid.stamps || []), stamp].slice(-10);
-  } else {
-    const idx = (store.polaroidHistory || []).findIndex((p) => p.id === polaroidId);
-    if (idx >= 0) {
-      store.polaroidHistory[idx].stamps = [
-        ...(store.polaroidHistory[idx].stamps || []),
-        stamp,
-      ].slice(-10);
+    if (!imageData) {
+      return res.status(400).json({ error: '请先选择一张照片呀' });
     }
-  }
 
-  addRecentEvent(from, emoji, `在拍立得上盖了一个「${label}」印章`);
-  saveStore();
+    if (store.polaroid?.imageData) {
+      store.polaroidHistory = [store.polaroid, ...(store.polaroidHistory || [])].slice(0, 30);
+    }
 
-  const payload = { from, target, polaroidId, stamp, state: sanitizeState(), ts: now };
-  broadcast('stamp', payload);
-  dispatchExternalPush(
-    target,
-    `${emoji} ${store.partners[from].name} 盖了个印章`,
-    `TA 在拍立得上啪地盖上了「${label}」`
-  );
-  res.json(payload);
-});
+    const now = Date.now();
+    store.polaroid = {
+      id: `pol-${now}`,
+      author: from,
+      imageData,
+      caption: caption || '拍下这一刻寄给你',
+      cityTag,
+      createdAt: now,
+      stamps: [],
+    };
+    addRecentEvent(from, '📸', `寄来一张新拍立得「${store.polaroid.caption}」`);
+    await saveStore();
 
-app.delete('/api/polaroid/:id', requireAuth, (req, res) => {
-  const id = req.params.id;
-  if (store.polaroid?.id === id) {
-    const nextLatest = (store.polaroidHistory || [])[0];
-    if (nextLatest) {
-      store.polaroid = nextLatest;
-      store.polaroidHistory = store.polaroidHistory.slice(1);
+    const payload = { from, target, polaroid: store.polaroid, state: sanitizeState(), ts: now };
+    broadcast('polaroid', payload);
+    await dispatchExternalPush(
+      target,
+      `📸 ${store.partners[from].name} 寄来一张拍立得`,
+      store.polaroid.caption
+    );
+    res.json(payload);
+  })
+);
+
+app.post(
+  '/api/polaroid/stamp',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const polaroidId = req.body.polaroidId ? String(req.body.polaroidId) : store.polaroid.id;
+    const label = String(req.body.label || '可爱满分').slice(0, 12);
+    const emoji = String(req.body.emoji || '♡');
+    const now = Date.now();
+
+    const stamp = {
+      id: `st-${now}-${Math.random().toString(36).slice(2, 5)}`,
+      by: from,
+      label,
+      emoji,
+      x: Math.round(18 + Math.random() * 62),
+      y: Math.round(20 + Math.random() * 58),
+      rotate: Math.round(-16 + Math.random() * 32),
+      createdAt: now,
+    };
+
+    if (polaroidId === store.polaroid.id) {
+      store.polaroid.stamps = [...(store.polaroid.stamps || []), stamp].slice(-10);
     } else {
-      store.polaroid = {
-        ...store.polaroid,
-        imageData: '',
-        caption: '想把每一个此刻，都拍下来寄给你',
-        stamps: [],
-      };
+      const idx = (store.polaroidHistory || []).findIndex((p) => p.id === polaroidId);
+      if (idx >= 0) {
+        store.polaroidHistory[idx].stamps = [
+          ...(store.polaroidHistory[idx].stamps || []),
+          stamp,
+        ].slice(-10);
+      }
     }
-  } else {
-    store.polaroidHistory = (store.polaroidHistory || []).filter((p) => p.id !== id);
-  }
-  saveStore();
-  const payload = { state: sanitizeState(), ts: Date.now() };
-  broadcast('polaroid_delete', payload);
-  res.json(payload);
-});
+
+    addRecentEvent(from, emoji, `在拍立得上盖了一个「${label}」印章`);
+    await saveStore();
+
+    const payload = { from, target, polaroidId, stamp, state: sanitizeState(), ts: now };
+    broadcast('stamp', payload);
+    await dispatchExternalPush(
+      target,
+      `${emoji} ${store.partners[from].name} 盖了个印章`,
+      `TA 在拍立得上啪地盖上了「${label}」`
+    );
+    res.json(payload);
+  })
+);
+
+app.delete(
+  '/api/polaroid/:id',
+  requireAuth,
+  ah(async (req, res) => {
+    const id = req.params.id;
+    if (store.polaroid?.id === id) {
+      const nextLatest = (store.polaroidHistory || [])[0];
+      if (nextLatest) {
+        store.polaroid = nextLatest;
+        store.polaroidHistory = store.polaroidHistory.slice(1);
+      } else {
+        store.polaroid = {
+          ...store.polaroid,
+          imageData: '',
+          caption: '想把每一个此刻，都拍下来寄给你',
+          stamps: [],
+        };
+      }
+    } else {
+      store.polaroidHistory = (store.polaroidHistory || []).filter((p) => p.id !== id);
+    }
+    await saveStore();
+    const payload = { state: sanitizeState(), ts: Date.now() };
+    broadcast('polaroid_delete', payload);
+    res.json(payload);
+  })
+);
 
 // Cities & multi-photo album
-app.post('/api/city', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const cityId = String(req.body.id || '');
-  const idx = (store.cities || []).findIndex((c) => c.id === cityId);
+app.post(
+  '/api/city',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const cityId = String(req.body.id || '');
+    const idx = (store.cities || []).findIndex((c) => c.id === cityId);
 
-  if (cityId === 'next') {
-    store.nextCity = {
-      name: String(req.body.name || store.nextCity.name).slice(0, 24),
-      note: String(req.body.note || store.nextCity.note).slice(0, 140),
-    };
-    addRecentEvent(from, '✦', `更新了你们的下一站约定「${store.nextCity.name}」`);
-  } else if (idx >= 0) {
-    const prev = store.cities[idx];
-    const nextPhotos = Array.isArray(req.body.photos)
-      ? req.body.photos.filter(Boolean).slice(0, 8)
-      : prev.photos || [];
-    store.cities[idx] = {
-      ...prev,
-      tagline: req.body.tagline !== undefined ? String(req.body.tagline).slice(0, 80) : prev.tagline,
-      memory: req.body.memory !== undefined ? String(req.body.memory).slice(0, 300) : prev.memory,
-      dateLabel:
-        req.body.dateLabel !== undefined ? String(req.body.dateLabel).slice(0, 20) : prev.dateLabel,
-      photos: nextPhotos,
-      photo: nextPhotos[0] || '',
-    };
-    addRecentEvent(from, '📍', `更新了「${prev.name}」的旅行记忆`);
-  } else {
-    return res.status(404).json({ error: '未找到对应城市' });
-  }
+    if (cityId === 'next') {
+      store.nextCity = {
+        name: String(req.body.name || store.nextCity.name).slice(0, 24),
+        note: String(req.body.note || store.nextCity.note).slice(0, 140),
+      };
+      addRecentEvent(from, '✦', `更新了你们的下一站约定「${store.nextCity.name}」`);
+    } else if (idx >= 0) {
+      const prev = store.cities[idx];
+      const nextPhotos = Array.isArray(req.body.photos)
+        ? req.body.photos.filter(Boolean).slice(0, 8)
+        : prev.photos || [];
+      store.cities[idx] = {
+        ...prev,
+        tagline:
+          req.body.tagline !== undefined ? String(req.body.tagline).slice(0, 80) : prev.tagline,
+        memory: req.body.memory !== undefined ? String(req.body.memory).slice(0, 300) : prev.memory,
+        dateLabel:
+          req.body.dateLabel !== undefined
+            ? String(req.body.dateLabel).slice(0, 20)
+            : prev.dateLabel,
+        photos: nextPhotos,
+        photo: nextPhotos[0] || '',
+      };
+      addRecentEvent(from, '📍', `更新了「${prev.name}」的旅行记忆`);
+    } else {
+      return res.status(404).json({ error: '未找到对应城市' });
+    }
 
-  saveStore();
-  const payload = { from, cityId, state: sanitizeState(), ts: Date.now() };
-  broadcast('city', payload);
-  res.json(payload);
-});
+    await saveStore();
+    const payload = { from, cityId, state: sanitizeState(), ts: Date.now() };
+    broadcast('city', payload);
+    res.json(payload);
+  })
+);
 
 // Coupons
-app.post('/api/coupon', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const couponId = String(req.body.couponId || '');
-  const actionType = req.body.type === 'accept' ? 'accept' : 'send';
+app.post(
+  '/api/coupon',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const couponId = String(req.body.couponId || '');
+    const actionType = req.body.type === 'accept' ? 'accept' : 'send';
 
-  const idx = (store.coupons || []).findIndex((c) => c.id === couponId);
-  if (idx < 0) return res.status(404).json({ error: '未找到该特权券' });
+    const idx = (store.coupons || []).findIndex((c) => c.id === couponId);
+    if (idx < 0) return res.status(404).json({ error: '未找到该特权券' });
 
-  const coupon = store.coupons[idx];
-  const now = Date.now();
+    const coupon = store.coupons[idx];
+    const now = Date.now();
 
-  if (actionType === 'send') {
-    coupon.activeRequest = {
+    if (actionType === 'send') {
+      coupon.activeRequest = {
+        from,
+        to: target,
+        sentAt: now,
+        acceptedAt: null,
+      };
+      addRecentEvent(from, coupon.emoji, `递出了一张「${coupon.title}」`);
+      await dispatchExternalPush(
+        target,
+        `${coupon.emoji} ${store.partners[from].name} 递来一张券`,
+        `TA 使用了「${coupon.title}」，快点开签收！`
+      );
+    } else {
+      coupon.usedCount = (coupon.usedCount || 0) + 1;
+      coupon.activeRequest = {
+        ...(coupon.activeRequest || { from: target, to: from, sentAt: now }),
+        acceptedAt: now,
+        acceptedBy: from,
+      };
+      addRecentEvent(from, '💮', `签收了「${coupon.title}」`);
+      await dispatchExternalPush(
+        target,
+        `💮 ${store.partners[from].name} 签收啦！`,
+        `TA 已经开心地盖章签收了「${coupon.title}」`
+      );
+    }
+
+    await saveStore();
+    const payload = { from, target, actionType, coupon, state: sanitizeState(), ts: now };
+    broadcast('coupon', payload);
+    res.json(payload);
+  })
+);
+
+// Daily Question
+app.post(
+  '/api/question/answer',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const answer = String(req.body.answer || '').trim().slice(0, 260);
+    if (!answer) return res.status(400).json({ error: '写几句再提交呀~' });
+
+    const q = store.questionState.current;
+    q.answers[from] = answer;
+    q.updatedAt = Date.now();
+
+    const bothAnswered = Boolean(q.answers.him && q.answers.her);
+    addRecentEvent(
       from,
-      to: target,
-      sentAt: now,
-      acceptedAt: null,
-    };
-    addRecentEvent(from, coupon.emoji, `递出了一张「${coupon.title}」`);
-    dispatchExternalPush(
-      target,
-      `${coupon.emoji} ${store.partners[from].name} 递来一张券`,
-      `TA 使用了「${coupon.title}」，快点开签收！`
+      '💬',
+      bothAnswered ? '回答了今日一问，双方答案已解锁！' : '写好了今日一问的答案，等你作答解锁'
     );
-  } else {
-    coupon.usedCount = (coupon.usedCount || 0) + 1;
-    coupon.activeRequest = {
-      ...(coupon.activeRequest || { from: target, to: from, sentAt: now }),
-      acceptedAt: now,
-      acceptedBy: from,
-    };
-    addRecentEvent(from, '💮', `签收了「${coupon.title}」`);
-    dispatchExternalPush(
+    await saveStore();
+
+    const payload = { from, target, bothAnswered, state: sanitizeState(), ts: Date.now() };
+    broadcast('question', payload);
+    await dispatchExternalPush(
       target,
-      `💮 ${store.partners[from].name} 签收啦！`,
-      `TA 已经开心地盖章签收了「${coupon.title}」`
+      bothAnswered ? '✨ 今日一问答案已双人解锁' : `💌 ${store.partners[from].name} 答完今日一问了`,
+      bothAnswered ? '你们都回答好了，快去看 TA 写了什么！' : 'TA 已留下心里话，等你回答后就能同时解锁'
     );
-  }
+    res.json(payload);
+  })
+);
 
-  saveStore();
-  const payload = { from, target, actionType, coupon, state: sanitizeState(), ts: now };
-  broadcast('coupon', payload);
-  res.json(payload);
-});
+app.post(
+  '/api/question/next',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const cur = store.questionState.current;
+    if (cur?.answers?.him || cur?.answers?.her) {
+      store.questionState.history = [
+        { ...cur, archivedAt: Date.now() },
+        ...(store.questionState.history || []),
+      ].slice(0, 30);
+    }
 
-// Daily Question (Double-blind unlock)
-app.post('/api/question/answer', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const answer = String(req.body.answer || '').trim().slice(0, 260);
-  if (!answer) return res.status(400).json({ error: '写几句再提交呀~' });
+    const nextIdx = ((store.questionState.index || 0) + 1) % QUESTION_BANK.length;
+    store.questionState.index = nextIdx;
+    store.questionState.current = {
+      id: `q-${Date.now()}`,
+      prompt: QUESTION_BANK[nextIdx],
+      answers: { him: '', her: '' },
+      updatedAt: Date.now(),
+    };
+    addRecentEvent(from, '🎲', '换了一道新的每日一问');
+    await saveStore();
 
-  const q = store.questionState.current;
-  q.answers[from] = answer;
-  q.updatedAt = Date.now();
+    const payload = { from, state: sanitizeState(), ts: Date.now() };
+    broadcast('question', payload);
+    res.json(payload);
+  })
+);
 
-  const bothAnswered = Boolean(q.answers.him && q.answers.her);
-  addRecentEvent(
-    from,
-    '💬',
-    bothAnswered ? '回答了今日一问，双方答案已解锁！' : '写好了今日一问的答案，等你作答解锁'
-  );
-  saveStore();
+app.post(
+  '/api/question/custom',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const prompt = String(req.body.prompt || '').trim().slice(0, 120);
+    if (!prompt) return res.status(400).json({ error: '请先写下想问 TA 的问题~' });
 
-  const payload = { from, target, bothAnswered, state: sanitizeState(), ts: Date.now() };
-  broadcast('question', payload);
-  dispatchExternalPush(
-    target,
-    bothAnswered ? '✨ 今日一问答案已双人解锁' : `💌 ${store.partners[from].name} 答完今日一问了`,
-    bothAnswered ? '你们都回答好了，快去看 TA 写了什么！' : 'TA 已留下心里话，等你回答后就能同时解锁'
-  );
-  res.json(payload);
-});
+    const cur = store.questionState.current;
+    if (cur?.answers?.him || cur?.answers?.her) {
+      store.questionState.history = [
+        { ...cur, archivedAt: Date.now() },
+        ...(store.questionState.history || []),
+      ].slice(0, 30);
+    }
 
-app.post('/api/question/next', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const cur = store.questionState.current;
-  if (cur?.answers?.him || cur?.answers?.her) {
-    store.questionState.history = [
-      { ...cur, archivedAt: Date.now() },
-      ...(store.questionState.history || []),
-    ].slice(0, 30);
-  }
+    store.questionState.current = {
+      id: `q-${Date.now()}`,
+      prompt,
+      by: from,
+      answers: { him: '', her: '' },
+      updatedAt: Date.now(),
+    };
+    addRecentEvent(from, '❓', `出了一道专属问题：「${prompt}」`);
+    await saveStore();
 
-  const nextIdx = ((store.questionState.index || 0) + 1) % QUESTION_BANK.length;
-  store.questionState.index = nextIdx;
-  store.questionState.current = {
-    id: `q-${Date.now()}`,
-    prompt: QUESTION_BANK[nextIdx],
-    answers: { him: '', her: '' },
-    updatedAt: Date.now(),
-  };
-  addRecentEvent(from, '🎲', '换了一道新的每日一问');
-  saveStore();
-
-  const payload = { from, state: sanitizeState(), ts: Date.now() };
-  broadcast('question', payload);
-  res.json(payload);
-});
-
-app.post('/api/question/custom', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const prompt = String(req.body.prompt || '').trim().slice(0, 120);
-  if (!prompt) return res.status(400).json({ error: '请先写下想问 TA 的问题~' });
-
-  const cur = store.questionState.current;
-  if (cur?.answers?.him || cur?.answers?.her) {
-    store.questionState.history = [
-      { ...cur, archivedAt: Date.now() },
-      ...(store.questionState.history || []),
-    ].slice(0, 30);
-  }
-
-  store.questionState.current = {
-    id: `q-${Date.now()}`,
-    prompt,
-    by: from,
-    answers: { him: '', her: '' },
-    updatedAt: Date.now(),
-  };
-  addRecentEvent(from, '❓', `出了一道专属问题：「${prompt}」`);
-  saveStore();
-
-  const payload = { from, state: sanitizeState(), ts: Date.now() };
-  broadcast('question', payload);
-  res.json(payload);
-});
+    const payload = { from, state: sanitizeState(), ts: Date.now() };
+    broadcast('question', payload);
+    res.json(payload);
+  })
+);
 
 // Wishlist
-app.post('/api/wishlist', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const text = String(req.body.text || '').trim().slice(0, 80);
-  const cityTag = String(req.body.cityTag || '约定').trim().slice(0, 14);
-  if (!text) return res.status(400).json({ error: '写下想一起做的事吧' });
+app.post(
+  '/api/wishlist',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const text = String(req.body.text || '').trim().slice(0, 80);
+    const cityTag = String(req.body.cityTag || '约定').trim().slice(0, 14);
+    if (!text) return res.status(400).json({ error: '写下想一起做的事吧' });
 
-  const item = {
-    id: `w-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-    text,
-    cityTag: cityTag || '约定',
-    done: false,
-    by: from,
-    createdAt: Date.now(),
-  };
-  store.wishlist = [item, ...(store.wishlist || [])].slice(0, 50);
-  addRecentEvent(from, '📝', `在见面清单里添加了「${text}」`);
-  saveStore();
+    const item = {
+      id: `w-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      text,
+      cityTag: cityTag || '约定',
+      done: false,
+      by: from,
+      createdAt: Date.now(),
+    };
+    store.wishlist = [item, ...(store.wishlist || [])].slice(0, 50);
+    addRecentEvent(from, '📝', `在见面清单里添加了「${text}」`);
+    await saveStore();
 
-  const payload = { from, item, state: sanitizeState(), ts: Date.now() };
-  broadcast('wishlist', payload);
-  res.json(payload);
-});
+    const payload = { from, item, state: sanitizeState(), ts: Date.now() };
+    broadcast('wishlist', payload);
+    res.json(payload);
+  })
+);
 
-app.post('/api/wishlist/toggle', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const id = String(req.body.id || '');
-  const idx = (store.wishlist || []).findIndex((w) => w.id === id);
-  if (idx < 0) return res.status(404).json({ error: '未找到愿望条目' });
+app.post(
+  '/api/wishlist/toggle',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const id = String(req.body.id || '');
+    const idx = (store.wishlist || []).findIndex((w) => w.id === id);
+    if (idx < 0) return res.status(404).json({ error: '未找到愿望条目' });
 
-  store.wishlist[idx].done = !store.wishlist[idx].done;
-  store.wishlist[idx].doneAt = store.wishlist[idx].done ? Date.now() : null;
-  if (store.wishlist[idx].done) {
-    addRecentEvent(from, '🎉', `一起实现了愿望「${store.wishlist[idx].text}」`);
-  }
-  saveStore();
+    store.wishlist[idx].done = !store.wishlist[idx].done;
+    store.wishlist[idx].doneAt = store.wishlist[idx].done ? Date.now() : null;
+    if (store.wishlist[idx].done) {
+      addRecentEvent(from, '🎉', `一起实现了愿望「${store.wishlist[idx].text}」`);
+    }
+    await saveStore();
 
-  const payload = { from, state: sanitizeState(), ts: Date.now() };
-  broadcast('wishlist', payload);
-  res.json(payload);
-});
+    const payload = { from, state: sanitizeState(), ts: Date.now() };
+    broadcast('wishlist', payload);
+    res.json(payload);
+  })
+);
 
-app.delete('/api/wishlist/:id', requireAuth, (req, res) => {
-  store.wishlist = (store.wishlist || []).filter((w) => w.id !== req.params.id);
-  saveStore();
-  const payload = { state: sanitizeState(), ts: Date.now() };
-  broadcast('wishlist', payload);
-  res.json(payload);
-});
+app.delete(
+  '/api/wishlist/:id',
+  requireAuth,
+  ah(async (req, res) => {
+    store.wishlist = (store.wishlist || []).filter((w) => w.id !== req.params.id);
+    await saveStore();
+    const payload = { state: sanitizeState(), ts: Date.now() };
+    broadcast('wishlist', payload);
+    res.json(payload);
+  })
+);
 
 // Emotion Control & Conflict Cooling
-app.post('/api/emotion/anger', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const level = Math.max(0, Math.min(100, Number(req.body.level || 0)));
+app.post(
+  '/api/emotion/anger',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const level = Math.max(0, Math.min(100, Number(req.body.level || 0)));
 
-  store.partners[from].angerLevel = level;
-  if (level === 0) {
-    store.emotionControl.peaceProposalBy = '';
-    if (store.partners[target].angerLevel === 0) {
-      store.emotionControl.recentSoothes = [];
+    store.partners[from].angerLevel = level;
+    if (level === 0) {
+      store.emotionControl.peaceProposalBy = '';
+      if (store.partners[target].angerLevel === 0) {
+        store.emotionControl.recentSoothes = [];
+      }
+      addRecentEvent(from, '☀️', '情绪回到平静晴天啦');
+    } else {
+      const desc =
+        level >= 90 ? '火山预警·需要先冷静一下' : level >= 65 ? '气鼓鼓中，需要哄一哄' : '有点小委屈';
+      addRecentEvent(from, '🌧️', `调整了情绪温度（${level}% · ${desc}）`);
+      await dispatchExternalPush(
+        target,
+        `🌧️ ${store.partners[from].name} 情绪温度 ${level}%`,
+        `${desc}，先别讲道理，打开小屋哄哄 TA 吧`
+      );
     }
-    addRecentEvent(from, '☀️', '情绪回到平静晴天啦');
-  } else {
-    const desc =
-      level >= 90 ? '火山预警·需要先冷静一下' : level >= 65 ? '气鼓鼓中，需要哄一哄' : '有点小委屈';
-    addRecentEvent(from, '🌧️', `调整了情绪温度（${level}% · ${desc}）`);
-    dispatchExternalPush(
-      target,
-      `🌧️ ${store.partners[from].name} 情绪温度 ${level}%`,
-      `${desc}，先别讲道理，打开小屋哄哄 TA 吧`
-    );
-  }
 
-  saveStore();
-  const payload = { from, target, level, state: sanitizeState(), ts: Date.now() };
-  broadcast('emotion', payload);
-  res.json(payload);
-});
+    await saveStore();
+    const payload = { from, target, level, state: sanitizeState(), ts: Date.now() };
+    broadcast('emotion', payload);
+    res.json(payload);
+  })
+);
 
-app.post('/api/emotion/soothe', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const label = String(req.body.label || '诚恳认错，先抱抱').slice(0, 32);
-  const now = Date.now();
+app.post(
+  '/api/emotion/soothe',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const label = String(req.body.label || '诚恳认错，先抱抱').slice(0, 32);
+    const now = Date.now();
 
-  store.partners[target].sootheCount = (store.partners[target].sootheCount || 0) + 1;
-  store.emotionControl.recentSoothes = [
-    {
-      id: `sth-${now}-${Math.random().toString(36).slice(2, 5)}`,
-      from,
-      label,
-      createdAt: now,
-    },
-    ...(store.emotionControl.recentSoothes || []),
-  ].slice(0, 8);
+    store.partners[target].sootheCount = (store.partners[target].sootheCount || 0) + 1;
+    store.emotionControl.recentSoothes = [
+      {
+        id: `sth-${now}-${Math.random().toString(36).slice(2, 5)}`,
+        from,
+        label,
+        createdAt: now,
+      },
+      ...(store.emotionControl.recentSoothes || []),
+    ].slice(0, 8);
 
-  addRecentEvent(from, '🧯', `正在认真哄 ${store.partners[target].name}：「${label}」`);
-  saveStore();
+    addRecentEvent(from, '🧯', `正在认真哄 ${store.partners[target].name}：「${label}」`);
+    await saveStore();
 
-  const payload = { from, target, label, state: sanitizeState(), ts: now };
-  broadcast('soothe', payload);
-  dispatchExternalPush(target, `🧯 ${store.partners[from].name} 来哄你啦`, label);
-  res.json(payload);
-});
+    const payload = { from, target, label, state: sanitizeState(), ts: now };
+    broadcast('soothe', payload);
+    await dispatchExternalPush(target, `🧯 ${store.partners[from].name} 来哄你啦`, label);
+    res.json(payload);
+  })
+);
 
-app.post('/api/emotion/cooldown', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const active = Boolean(req.body.active);
-  const minutes = Math.max(5, Math.min(30, Number(req.body.minutes || 15)));
-  const now = Date.now();
+app.post(
+  '/api/emotion/cooldown',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const active = Boolean(req.body.active);
+    const minutes = Math.max(5, Math.min(30, Number(req.body.minutes || 15)));
+    const now = Date.now();
 
-  if (active) {
-    store.emotionControl.cooldownUntil = now + minutes * 60 * 1000;
-    store.emotionControl.cooldownBy = from;
-    addRecentEvent(from, '⏸️', `开启了 ${minutes} 分钟冷静呼吸保护，冷静下来就回来抱你`);
-    dispatchExternalPush(
-      target,
-      `⏸️ ${store.partners[from].name} 开启了冷静呼吸`,
-      `TA 怕气头上说伤人的话，约好冷静 ${minutes} 分钟后再好好聊`
-    );
-  } else {
+    if (active) {
+      store.emotionControl.cooldownUntil = now + minutes * 60 * 1000;
+      store.emotionControl.cooldownBy = from;
+      addRecentEvent(from, '⏸️', `开启了 ${minutes} 分钟冷静呼吸保护，冷静下来就回来抱你`);
+      await dispatchExternalPush(
+        target,
+        `⏸️ ${store.partners[from].name} 开启了冷静呼吸`,
+        `TA 怕气头上说伤人的话，约好冷静 ${minutes} 分钟后再好好聊`
+      );
+    } else {
+      store.emotionControl.cooldownUntil = 0;
+      store.emotionControl.cooldownBy = '';
+      addRecentEvent(from, '🌿', '结束了冷静呼吸，想和 TA 好好聊一聊');
+      await dispatchExternalPush(
+        target,
+        `🌿 ${store.partners[from].name} 冷静下来啦`,
+        'TA 准备好了，回来抱抱和好吧'
+      );
+    }
+
+    await saveStore();
+    const payload = { from, target, active, state: sanitizeState(), ts: now };
+    broadcast('emotion', payload);
+    res.json(payload);
+  })
+);
+
+app.post(
+  '/api/emotion/peace',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const target = from === 'him' ? 'her' : 'him';
+    const type = req.body.type === 'accept' ? 'accept' : 'propose';
+    const now = Date.now();
+
+    if (type === 'propose') {
+      store.emotionControl.peaceProposalBy = from;
+      addRecentEvent(from, '🏳️', '举起白旗求和：别吵啦，好想抱你');
+      await saveStore();
+      const payload = { from, target, type, state: sanitizeState(), ts: now };
+      broadcast('emotion', payload);
+      await dispatchExternalPush(
+        target,
+        `🏳️ ${store.partners[from].name} 举白旗求和啦`,
+        '点开小屋「和好」，一起雨过天晴吧！'
+      );
+      return res.json(payload);
+    }
+
+    store.partners.him.angerLevel = 0;
+    store.partners.her.angerLevel = 0;
     store.emotionControl.cooldownUntil = 0;
     store.emotionControl.cooldownBy = '';
-    addRecentEvent(from, '🌿', '结束了冷静呼吸，想和 TA 好好聊一聊');
-    dispatchExternalPush(
+    store.emotionControl.peaceProposalBy = '';
+    store.emotionControl.recentSoothes = [];
+    addRecentEvent(from, '🌈', '接受了和好！雨过天晴，下不为例');
+    await saveStore();
+
+    const payload = { from, target, type: 'accept', state: sanitizeState(), ts: now };
+    broadcast('peace_resolved', payload);
+    await dispatchExternalPush(
       target,
-      `🌿 ${store.partners[from].name} 冷静下来啦`,
-      'TA 准备好了，回来抱抱和好吧'
+      '🌈 雨过天晴！你们和好啦',
+      `${store.partners[from].name} 接受了和好，快发个抱抱吧！`
     );
-  }
+    res.json(payload);
+  })
+);
 
-  saveStore();
-  const payload = { from, target, active, state: sanitizeState(), ts: now };
-  broadcast('emotion', payload);
-  res.json(payload);
-});
-
-app.post('/api/emotion/peace', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const target = from === 'him' ? 'her' : 'him';
-  const type = req.body.type === 'accept' ? 'accept' : 'propose';
-  const now = Date.now();
-
-  if (type === 'propose') {
-    store.emotionControl.peaceProposalBy = from;
-    addRecentEvent(from, '🏳️', '举起白旗求和：别吵啦，好想抱你');
-    saveStore();
-    const payload = { from, target, type, state: sanitizeState(), ts: now };
+app.post(
+  '/api/emotion/note',
+  requireAuth,
+  ah(async (req, res) => {
+    const from = req.body.from === 'her' ? 'her' : 'him';
+    const note = String(req.body.note || '').trim().slice(0, 140);
+    store.emotionControl.peaceNotes[from] = note;
+    await saveStore();
+    const payload = { from, state: sanitizeState(), ts: Date.now() };
     broadcast('emotion', payload);
-    dispatchExternalPush(
-      target,
-      `🏳️ ${store.partners[from].name} 举白旗求和啦`,
-      '点开小屋「和好」，一起雨过天晴吧！'
-    );
-    return res.json(payload);
-  }
-
-  // Accepted peace -> reset anger & cooldown
-  store.partners.him.angerLevel = 0;
-  store.partners.her.angerLevel = 0;
-  store.emotionControl.cooldownUntil = 0;
-  store.emotionControl.cooldownBy = '';
-  store.emotionControl.peaceProposalBy = '';
-  store.emotionControl.recentSoothes = [];
-  addRecentEvent(from, '🌈', '接受了和好！雨过天晴，下不为例');
-  saveStore();
-
-  const payload = { from, target, type: 'accept', state: sanitizeState(), ts: now };
-  broadcast('peace_resolved', payload);
-  dispatchExternalPush(
-    target,
-    '🌈 雨过天晴！你们和好啦',
-    `${store.partners[from].name} 接受了和好，快发个抱抱吧！`
-  );
-  res.json(payload);
-});
-
-app.post('/api/emotion/note', requireAuth, (req, res) => {
-  const from = req.body.from === 'her' ? 'her' : 'him';
-  const note = String(req.body.note || '').trim().slice(0, 140);
-  store.emotionControl.peaceNotes[from] = note;
-  saveStore();
-  const payload = { from, state: sanitizeState(), ts: Date.now() };
-  broadcast('emotion', payload);
-  res.json(payload);
-});
+    res.json(payload);
+  })
+);
 
 // Settings
-app.post('/api/settings', requireAuth, (req, res) => {
-  ensureTodayReset();
-  const { couple, him, her } = req.body || {};
+app.post(
+  '/api/settings',
+  requireAuth,
+  ah(async (req, res) => {
+    const { couple, him, her } = req.body || {};
 
-  if (couple) {
-    store.couple = {
-      ...store.couple,
-      title: couple.title !== undefined ? String(couple.title).slice(0, 24) : store.couple.title,
-      anniversaryDate:
-        couple.anniversaryDate !== undefined ? couple.anniversaryDate : store.couple.anniversaryDate,
-      reunionDate: couple.reunionDate !== undefined ? couple.reunionDate : store.couple.reunionDate,
-      loveQuote:
-        couple.loveQuote !== undefined ? String(couple.loveQuote).slice(0, 50) : store.couple.loveQuote,
-      distanceKm:
-        couple.distanceKm !== undefined ? Number(couple.distanceKm) || 0 : store.couple.distanceKm,
-      appPublicUrl:
-        couple.appPublicUrl !== undefined ? String(couple.appPublicUrl).trim() : store.couple.appPublicUrl,
-    };
-  }
-  if (him) {
-    store.partners.him = {
-      ...store.partners.him,
-      name: him.name !== undefined ? String(him.name).slice(0, 16) : store.partners.him.name,
-      city: him.city !== undefined ? String(him.city).slice(0, 12) : store.partners.him.city,
-      avatarEmoji: him.avatarEmoji || store.partners.him.avatarEmoji,
-      pushUrl: him.pushUrl !== undefined ? String(him.pushUrl).trim() : store.partners.him.pushUrl,
-    };
-  }
-  if (her) {
-    store.partners.her = {
-      ...store.partners.her,
-      name: her.name !== undefined ? String(her.name).slice(0, 16) : store.partners.her.name,
-      city: her.city !== undefined ? String(her.city).slice(0, 12) : store.partners.her.city,
-      avatarEmoji: her.avatarEmoji || store.partners.her.avatarEmoji,
-      pushUrl: her.pushUrl !== undefined ? String(her.pushUrl).trim() : store.partners.her.pushUrl,
-    };
-  }
+    if (couple) {
+      store.couple = {
+        ...store.couple,
+        title: couple.title !== undefined ? String(couple.title).slice(0, 24) : store.couple.title,
+        anniversaryDate:
+          couple.anniversaryDate !== undefined ? couple.anniversaryDate : store.couple.anniversaryDate,
+        reunionDate:
+          couple.reunionDate !== undefined ? couple.reunionDate : store.couple.reunionDate,
+        loveQuote:
+          couple.loveQuote !== undefined
+            ? String(couple.loveQuote).slice(0, 50)
+            : store.couple.loveQuote,
+        distanceKm:
+          couple.distanceKm !== undefined ? Number(couple.distanceKm) || 0 : store.couple.distanceKm,
+        appPublicUrl:
+          couple.appPublicUrl !== undefined
+            ? String(couple.appPublicUrl).trim()
+            : store.couple.appPublicUrl,
+      };
+    }
+    if (him) {
+      store.partners.him = {
+        ...store.partners.him,
+        name: him.name !== undefined ? String(him.name).slice(0, 16) : store.partners.him.name,
+        city: him.city !== undefined ? String(him.city).slice(0, 12) : store.partners.him.city,
+        avatarEmoji: him.avatarEmoji || store.partners.him.avatarEmoji,
+        pushUrl: him.pushUrl !== undefined ? String(him.pushUrl).trim() : store.partners.him.pushUrl,
+      };
+    }
+    if (her) {
+      store.partners.her = {
+        ...store.partners.her,
+        name: her.name !== undefined ? String(her.name).slice(0, 16) : store.partners.her.name,
+        city: her.city !== undefined ? String(her.city).slice(0, 12) : store.partners.her.city,
+        avatarEmoji: her.avatarEmoji || store.partners.her.avatarEmoji,
+        pushUrl: her.pushUrl !== undefined ? String(her.pushUrl).trim() : store.partners.her.pushUrl,
+      };
+    }
 
-  saveStore();
-  const payload = { state: sanitizeState(), ts: Date.now() };
-  broadcast('settings', payload);
-  res.json(payload);
+    await saveStore();
+    const payload = { state: sanitizeState(), ts: Date.now() };
+    broadcast('settings', payload);
+    res.json(payload);
+  })
+);
+
+app.post(
+  '/api/push/test',
+  requireAuth,
+  ah(async (req, res) => {
+    const targetRole = req.body.target === 'her' ? 'her' : 'him';
+    const result = await dispatchExternalPush(
+      targetRole,
+      '💌 心动小屋测试成功',
+      '以后每次 TA 想你、求抱抱或发拍立得，这里都会第一时间通知你！'
+    );
+    res.json(result);
+  })
+);
+
+// Error handler
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: err.message || '服务器开小差了' });
 });
 
-app.post('/api/push/test', requireAuth, async (req, res) => {
-  const targetRole = req.body.target === 'her' ? 'her' : 'him';
-  const result = await dispatchExternalPush(
-    targetRole,
-    '💌 心动小屋测试成功',
-    '以后每次 TA 想你、求抱抱或发拍立得，这里都会第一时间通知你！'
-  );
-  res.json(result);
-});
-
-if (fs.existsSync(DIST_DIR)) {
+if (!process.env.VERCEL && fs.existsSync(DIST_DIR)) {
   app.use(express.static(DIST_DIR));
   app.get('*', (_req, res) => {
     res.sendFile(path.join(DIST_DIR, 'index.html'));
@@ -1227,10 +1343,14 @@ function getLocalLanIps() {
   return results;
 }
 
-app.listen(PORT, '0.0.0.0', () => {
-  const ips = getLocalLanIps();
-  console.log(`\n💗 心动小屋后端服务已启动: http://localhost:${PORT}`);
-  if (ips.length > 0) {
-    console.log(`📱 同一 Wi-Fi 局域网访问: http://${ips[0]}:${PORT}`);
-  }
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, '0.0.0.0', () => {
+    const ips = getLocalLanIps();
+    console.log(`\n💗 心动小屋后端服务已启动: http://localhost:${PORT}`);
+    if (ips.length > 0) {
+      console.log(`📱 同一 Wi-Fi 局域网访问: http://${ips[0]}:${PORT}`);
+    }
+  });
+}
+
+export default app;

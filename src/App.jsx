@@ -19,6 +19,7 @@ import SettingsPage from './pages/SettingsPage';
 import CityModal from './components/CityModal';
 import { HeartMedallion } from './components/CityArtwork';
 import { apiFetch, getSavedToken, saveToken } from './utils/api';
+import { emitRealtime, isSupabaseRealtimeEnabled, subscribeRealtime } from './utils/realtime';
 import { compressImageFile } from './utils/image';
 import { PULSE_ACTIONS } from './utils/constants';
 import {
@@ -75,6 +76,7 @@ export default function App() {
   const bannerTimerRef = useRef(null);
   const myRoleRef = useRef(myRole);
   const soundEnabledRef = useRef(soundEnabled);
+  const stateRef = useRef(state);
 
   useEffect(() => {
     myRoleRef.current = myRole;
@@ -83,6 +85,10 @@ export default function App() {
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
@@ -142,24 +148,161 @@ export default function App() {
     }
   }
 
-  // Load state & subscribe to authenticated SSE once unlocked
+  // Load state & subscribe to real-time sync (Supabase Realtime on cloud, SSE locally)
   useEffect(() => {
     if (!token || !authMeta?.authorized) return;
 
     let active = true;
-    apiFetch('/api/state')
-      .then((data) => {
+
+    async function refreshState() {
+      try {
+        const data = await apiFetch('/api/state');
         if (!active) return;
         setState(data.state);
-        setOnline(data.online || { him: false, her: false });
-      })
-      .catch((err) => {
+        if (!isSupabaseRealtimeEnabled() && data.online) {
+          setOnline(data.online);
+        }
+      } catch (err) {
         if (err.status === 401) {
           saveToken('');
           setToken('');
           setState(null);
         }
+      }
+    }
+
+    refreshState();
+
+    function handleRealtimeEvent(eventName, data = {}) {
+      if (!active) return;
+      if (data.state) {
+        setState(data.state);
+      } else {
+        refreshState();
+      }
+      if (data.online) setOnline(data.online);
+
+      const sender =
+        data.state?.partners?.[data.from] || stateRef.current?.partners?.[data.from];
+      const isFromPartner = data.from && data.from !== myRoleRef.current;
+
+      if (eventName === 'pulse') {
+        if (data.telepathy) {
+          setTelepathyBanner(true);
+          spawnParticles(16, true);
+          triggerHaptic([60, 50, 90, 50, 120]);
+          if (soundEnabledRef.current) playTelepathySound();
+          setTimeout(() => setTelepathyBanner(false), 4800);
+        } else if (isFromPartner) {
+          setIncomingFlash(true);
+          setTimeout(() => setIncomingFlash(false), 950);
+          spawnParticles(10, true);
+          triggerHaptic([35, 35, 65]);
+          if (soundEnabledRef.current) playReceivePing();
+          showBanner(
+            `${sender?.name || 'TA'} 刚刚对你发来「${data.action?.label || '想你了'}」`,
+            data.combo > 1 ? `已经连续心动提醒你 ${data.combo} 次啦` : '轻点这里回抱一下 TA'
+          );
+          maybeBrowserNotify(
+            `${sender?.name || 'TA'}`,
+            `刚刚向你发送了「${data.action?.label || '想你了'}」`
+          );
+        }
+      } else if (eventName === 'mood' && isFromPartner) {
+        triggerHaptic([30, 40, 30]);
+        if (soundEnabledRef.current) playReceivePing();
+        showBanner(
+          `${sender?.name || 'TA'} 换成了「${data.moodLabel}」状态`,
+          data.mood === 'hug' ? 'TA 现在很需要一个大大的抱抱' : '点这里马上回应 TA'
+        );
+        maybeBrowserNotify(`${sender?.name || 'TA'}`, `此刻状态：${data.moodLabel}`);
+      } else if (eventName === 'polaroid' && isFromPartner) {
+        spawnParticles(8, true);
+        triggerHaptic([40, 30, 40]);
+        if (soundEnabledRef.current) playReceivePing();
+        showBanner(`${sender?.name || 'TA'} 寄来一张新的拍立得`, data.caption || data.polaroid?.caption || '');
+        maybeBrowserNotify(`${sender?.name || 'TA'} 发来新照片`, data.caption || data.polaroid?.caption || '');
+      } else if (eventName === 'stamp' && isFromPartner) {
+        triggerHaptic([45]);
+        if (soundEnabledRef.current) playStampSound();
+        showBanner(
+          `${sender?.name || 'TA'} 在拍立得上盖了一枚印章`,
+          `「${data.label || data.stamp?.label || ''}」`
+        );
+      } else if (eventName === 'coupon' && isFromPartner) {
+        spawnParticles(8, true);
+        triggerHaptic([50, 40, 70]);
+        if (soundEnabledRef.current) {
+          data.actionType === 'accept' ? playStampSound() : playReceivePing();
+        }
+        const title = data.couponTitle || data.coupon?.title || '特权券';
+        showBanner(
+          data.actionType === 'accept'
+            ? `${sender?.name || 'TA'} 签收了「${title}」`
+            : `${sender?.name || 'TA'} 递来一张「${title}」`,
+          data.actionType === 'accept' ? '约定生效，记得兑换哦' : '去互动小馆或首页即可签收'
+        );
+      } else if (eventName === 'question' && isFromPartner) {
+        if (soundEnabledRef.current) playReceivePing();
+        showBanner(
+          data.bothAnswered ? '今日一问答案已双人解锁' : `${sender?.name || 'TA'} 更新了今日一问`,
+          data.bothAnswered ? '快去互动小馆看看 TA 写了什么' : '等你写下回答一起揭晓'
+        );
+      } else if (eventName === 'soothe' && isFromPartner) {
+        setIncomingFlash(true);
+        setTimeout(() => setIncomingFlash(false), 950);
+        spawnParticles(8, true);
+        triggerHaptic([35, 35, 50]);
+        if (soundEnabledRef.current) playReceivePing();
+        showBanner(`${sender?.name || 'TA'} 正在认真哄你`, `「${data.label}」`);
+      } else if (eventName === 'peace_resolved') {
+        setPeaceBanner(true);
+        spawnParticles(16, true);
+        triggerHaptic([50, 40, 80]);
+        if (soundEnabledRef.current) playTelepathySound();
+        setTimeout(() => setPeaceBanner(false), 4500);
+      } else if (eventName === 'emotion' && isFromPartner) {
+        if (typeof data.level === 'number' && data.level >= 35) {
+          triggerHaptic([40, 30, 40]);
+          if (soundEnabledRef.current) playReceivePing();
+          showBanner(
+            `${sender?.name || 'TA'} 的情绪温度升到了 ${data.level}%`,
+            '先别急着讲道理，快去情绪台哄哄 TA~'
+          );
+        } else if (data.active) {
+          showBanner(
+            `${sender?.name || 'TA'} 开启了冷静呼吸保护`,
+            'TA 怕气头上说重话，冷静好就会回来找你'
+          );
+        } else if (data.type === 'propose') {
+          if (soundEnabledRef.current) playReceivePing();
+          showBanner(`${sender?.name || 'TA'} 举白旗求和啦`, '快点开「和好」一起雨过天晴吧！');
+        }
+      }
+    }
+
+    if (isSupabaseRealtimeEnabled()) {
+      const unsubscribe = subscribeRealtime({
+        role: myRole || 'guest',
+        onPresence: (p) => {
+          if (active) setOnline(p);
+        },
+        onEvent: handleRealtimeEvent,
       });
+
+      const onVis = () => {
+        if (document.visibilityState === 'visible') refreshState();
+      };
+      document.addEventListener('visibilitychange', onVis);
+      const pollTimer = setInterval(refreshState, 15000);
+
+      return () => {
+        active = false;
+        unsubscribe();
+        document.removeEventListener('visibilitychange', onVis);
+        clearInterval(pollTimer);
+      };
+    }
 
     const roleParam = myRole || 'guest';
     const es = new EventSource(
@@ -177,165 +320,22 @@ export default function App() {
       setOnline(data.online || { him: false, her: false });
     });
 
-    es.addEventListener('pulse', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      setOnline(data.online || { him: false, her: false });
-
-      if (data.telepathy) {
-        setTelepathyBanner(true);
-        spawnParticles(16, true);
-        triggerHaptic([60, 50, 90, 50, 120]);
-        if (soundEnabledRef.current) playTelepathySound();
-        setTimeout(() => setTelepathyBanner(false), 4800);
-      } else if (data.from !== myRoleRef.current) {
-        const sender = data.state?.partners?.[data.from];
-        setIncomingFlash(true);
-        setTimeout(() => setIncomingFlash(false), 950);
-        spawnParticles(10, true);
-        triggerHaptic([35, 35, 65]);
-        if (soundEnabledRef.current) playReceivePing();
-        showBanner(
-          `${sender?.name || 'TA'} 刚刚对你发来「${data.action?.label || '想你了'}」`,
-          data.combo > 1 ? `已经连续心动提醒你 ${data.combo} 次啦` : '轻点这里回抱一下 TA'
-        );
-        maybeBrowserNotify(
-          `${sender?.name || 'TA'}`,
-          `刚刚向你发送了「${data.action?.label || '想你了'}」`
-        );
-      }
-    });
-
-    es.addEventListener('mood', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      if (data.from !== myRoleRef.current) {
-        const sender = data.state?.partners?.[data.from];
-        triggerHaptic([30, 40, 30]);
-        if (soundEnabledRef.current) playReceivePing();
-        showBanner(
-          `${sender?.name || 'TA'} 换成了「${data.moodLabel}」状态`,
-          data.mood === 'hug' ? 'TA 现在很需要一个大大的抱抱' : '点这里马上回应 TA'
-        );
-        maybeBrowserNotify(`${sender?.name || 'TA'}`, `此刻状态：${data.moodLabel}`);
-      }
-    });
-
-    es.addEventListener('polaroid', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      if (data.from !== myRoleRef.current) {
-        const sender = data.state?.partners?.[data.from];
-        spawnParticles(8, true);
-        triggerHaptic([40, 30, 40]);
-        if (soundEnabledRef.current) playReceivePing();
-        showBanner(`${sender?.name || 'TA'} 寄来一张新的拍立得`, data.polaroid?.caption || '');
-        maybeBrowserNotify(`${sender?.name || 'TA'} 发来新照片`, data.polaroid?.caption || '');
-      }
-    });
-
-    es.addEventListener('stamp', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      if (data.from !== myRoleRef.current) {
-        const sender = data.state?.partners?.[data.from];
-        triggerHaptic([45]);
-        if (soundEnabledRef.current) playStampSound();
-        showBanner(
-          `${sender?.name || 'TA'} 在拍立得上盖了一枚印章`,
-          `「${data.stamp?.label || ''}」`
-        );
-      }
-    });
-
-    es.addEventListener('coupon', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      if (data.from !== myRoleRef.current) {
-        const sender = data.state?.partners?.[data.from];
-        spawnParticles(8, true);
-        triggerHaptic([50, 40, 70]);
-        if (soundEnabledRef.current) {
-          data.actionType === 'accept' ? playStampSound() : playReceivePing();
-        }
-        showBanner(
-          data.actionType === 'accept'
-            ? `${sender?.name || 'TA'} 签收了「${data.coupon?.title}」`
-            : `${sender?.name || 'TA'} 递来一张「${data.coupon?.title}」`,
-          data.actionType === 'accept' ? '约定生效，记得兑换哦' : '去互动小馆或首页即可签收'
-        );
-      }
-    });
-
-    es.addEventListener('question', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      if (data.from !== myRoleRef.current) {
-        const sender = data.state?.partners?.[data.from];
-        if (soundEnabledRef.current) playReceivePing();
-        showBanner(
-          data.bothAnswered
-            ? '今日一问答案已双人解锁'
-            : `${sender?.name || 'TA'} 更新了今日一问`,
-          data.bothAnswered ? '快去互动小馆看看 TA 写了什么' : '等你写下回答一起揭晓'
-        );
-      }
-    });
-
-    es.addEventListener('soothe', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      if (data.from !== myRoleRef.current) {
-        const sender = data.state?.partners?.[data.from];
-        setIncomingFlash(true);
-        setTimeout(() => setIncomingFlash(false), 950);
-        spawnParticles(8, true);
-        triggerHaptic([35, 35, 50]);
-        if (soundEnabledRef.current) playReceivePing();
-        showBanner(
-          `${sender?.name || 'TA'} 正在认真哄你`,
-          `「${data.label}」`
-        );
-      }
-    });
-
-    es.addEventListener('peace_resolved', (e) => {
-      const data = JSON.parse(e.data);
-      setState(data.state);
-      setPeaceBanner(true);
-      spawnParticles(16, true);
-      triggerHaptic([50, 40, 80]);
-      if (soundEnabledRef.current) playTelepathySound();
-      setTimeout(() => setPeaceBanner(false), 4500);
-    });
-
-    ['city', 'settings', 'wishlist', 'polaroid_delete', 'emotion'].forEach((evt) => {
-      es.addEventListener(evt, (e) => {
-        const data = JSON.parse(e.data);
-        setState(data.state);
-        if (evt === 'emotion' && data.from !== myRoleRef.current) {
-          const sender = data.state?.partners?.[data.from];
-          if (typeof data.level === 'number' && data.level >= 35) {
-            triggerHaptic([40, 30, 40]);
-            if (soundEnabledRef.current) playReceivePing();
-            showBanner(
-              `${sender?.name || 'TA'} 的情绪温度升到了 ${data.level}%`,
-              '先别急着讲道理，快去情绪台哄哄 TA~'
-            );
-          } else if (data.active) {
-            showBanner(
-              `${sender?.name || 'TA'} 开启了冷静呼吸保护`,
-              'TA 怕气头上说重话，冷静好就会回来找你'
-            );
-          } else if (data.type === 'propose') {
-            if (soundEnabledRef.current) playReceivePing();
-            showBanner(
-              `${sender?.name || 'TA'} 举白旗求和啦`,
-              '快点开「和好」一起雨过天晴吧！'
-            );
-          }
-        }
-      });
+    [
+      'pulse',
+      'mood',
+      'polaroid',
+      'stamp',
+      'coupon',
+      'question',
+      'soothe',
+      'peace_resolved',
+      'city',
+      'settings',
+      'wishlist',
+      'polaroid_delete',
+      'emotion',
+    ].forEach((evt) => {
+      es.addEventListener(evt, (e) => handleRealtimeEvent(evt, JSON.parse(e.data)));
     });
 
     return () => {
@@ -404,6 +404,12 @@ export default function App() {
         body: JSON.stringify({ from: myRole, action, combo: nextCombo }),
       });
       if (data.state) setState(data.state);
+      emitRealtime('pulse', {
+        from: myRole,
+        action,
+        combo: nextCombo,
+        telepathy: Boolean(data.telepathy),
+      });
     } catch {
       // ignore transient error
     }
@@ -425,12 +431,17 @@ export default function App() {
       }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('mood', {
+      from: myRole,
+      mood: moodObj.key,
+      moodLabel: moodObj.full,
+    });
   }
 
   async function handlePolaroidFile(e, openModal = false) {
     const file = e.target.files?.[0];
     if (!file) return;
-    const compressed = await compressImageFile(file, 900, 0.82);
+    const compressed = await compressImageFile(file, 840, 0.78);
     setPolaroidDraft(compressed);
     setCaptionInput('');
     if (openModal) setShowGlobalPolaroidModal(true);
@@ -440,17 +451,19 @@ export default function App() {
     e.preventDefault();
     if (!polaroidDraft || !myRole) return;
     setUploadingPolaroid(true);
+    const caption = captionInput.trim() || '拍下这一刻寄给你';
     try {
       const data = await apiFetch('/api/polaroid', {
         method: 'POST',
         body: JSON.stringify({
           from: myRole,
           imageData: polaroidDraft,
-          caption: captionInput.trim() || '拍下这一刻寄给你',
+          caption,
           cityTag: state?.partners?.[myRole]?.city || '此刻',
         }),
       });
       if (data.state) setState(data.state);
+      emitRealtime('polaroid', { from: myRole, caption });
       setPolaroidDraft(null);
       setCaptionInput('');
       setShowGlobalPolaroidModal(false);
@@ -470,6 +483,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, polaroidId, ...stampObj }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('stamp', { from: myRole, label: stampObj.label });
   }
 
   async function handleDeletePolaroid(id) {
@@ -477,6 +491,7 @@ export default function App() {
       method: 'DELETE',
     });
     if (data.state) setState(data.state);
+    emitRealtime('polaroid_delete', { from: myRole });
   }
 
   async function handleSaveCity(payload) {
@@ -485,6 +500,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, ...payload }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('city', { from: myRole });
   }
 
   async function handleCoupon(couponId, type) {
@@ -497,6 +513,11 @@ export default function App() {
       body: JSON.stringify({ from: myRole, couponId, type }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('coupon', {
+      from: myRole,
+      actionType: type,
+      couponTitle: data.coupon?.title,
+    });
   }
 
   async function handleAnswerQuestion(answer) {
@@ -506,6 +527,7 @@ export default function App() {
     });
     if (data.state) setState(data.state);
     if (soundEnabled) playStampSound();
+    emitRealtime('question', { from: myRole, bothAnswered: Boolean(data.bothAnswered) });
   }
 
   async function handleNextQuestion() {
@@ -514,6 +536,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('question', { from: myRole, bothAnswered: false });
   }
 
   async function handleCustomQuestion(prompt) {
@@ -522,6 +545,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, prompt }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('question', { from: myRole, bothAnswered: false });
   }
 
   async function handleAddWishlist(text, cityTag) {
@@ -530,6 +554,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, text, cityTag }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('wishlist', { from: myRole });
   }
 
   async function handleToggleWishlist(id) {
@@ -539,6 +564,7 @@ export default function App() {
     });
     if (data.state) setState(data.state);
     if (soundEnabled) playPulseSound(2);
+    emitRealtime('wishlist', { from: myRole });
   }
 
   async function handleDeleteWishlist(id) {
@@ -546,6 +572,7 @@ export default function App() {
       method: 'DELETE',
     });
     if (data.state) setState(data.state);
+    emitRealtime('wishlist', { from: myRole });
   }
 
   async function handleSaveSettings(payload) {
@@ -554,6 +581,7 @@ export default function App() {
       body: JSON.stringify(payload),
     });
     if (data.state) setState(data.state);
+    emitRealtime('settings', { from: myRole });
   }
 
   async function handleUpdatePasscode(nextPasscode) {
@@ -596,6 +624,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, level }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('emotion', { from: myRole, level });
   }
 
   async function handleSoothe(label) {
@@ -607,6 +636,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, label }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('soothe', { from: myRole, label });
   }
 
   async function handleToggleCooldown(active) {
@@ -616,6 +646,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, active, minutes: 15 }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('emotion', { from: myRole, active });
   }
 
   async function handlePeace(type) {
@@ -630,8 +661,10 @@ export default function App() {
       spawnParticles(16, true);
       if (soundEnabled) playTelepathySound();
       setTimeout(() => setPeaceBanner(false), 4500);
-    } else if (soundEnabled) {
-      playPulseSound(2);
+      emitRealtime('peace_resolved', { from: myRole });
+    } else {
+      if (soundEnabled) playPulseSound(2);
+      emitRealtime('emotion', { from: myRole, type: 'propose' });
     }
   }
 
@@ -641,6 +674,7 @@ export default function App() {
       body: JSON.stringify({ from: myRole, note }),
     });
     if (data.state) setState(data.state);
+    emitRealtime('emotion', { from: myRole });
   }
 
   // Waiting for initial auth check
