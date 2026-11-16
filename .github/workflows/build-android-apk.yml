@@ -28,9 +28,6 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install dependencies & build web bundle
         run: |
           npm ci
@@ -63,6 +60,12 @@ jobs:
 
       - name: Build Android Debug APK
         run: |
+          if [ -n "${ANDROID_HOME:-}" ] && [ -d "${ANDROID_HOME}/cmdline-tools" ]; then
+            SDKMGR=$(find "${ANDROID_HOME}/cmdline-tools" -name sdkmanager -type f | head -n 1 || true)
+            if [ -n "$SDKMGR" ]; then
+              yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+            fi
+          fi
           cd android
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
